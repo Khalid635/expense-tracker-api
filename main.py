@@ -1,7 +1,10 @@
+import os
 from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
+from sqlalchemy.exc import IntegrityError
 from datetime import date
 from decimal import Decimal
 from models import User, Transaction, Base
@@ -15,6 +18,21 @@ from auth import hash_password, verify_password, create_access_token, decode_tok
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Expense Tracker API", version="1.0.0")
+
+# Browser frontends can call this API only from an allowed origin. The
+# default covers the common local dev servers; set ALLOWED_ORIGINS
+# (comma-separated) in the environment for production.
+_allowed_origins = [
+    origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 security = HTTPBearer()
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)) -> User:
@@ -61,7 +79,16 @@ def register(user_data: UserRegister, db: Session = Depends(get_db)):
         hashed_password=hash_password(user_data.password)
     )
     db.add(new_user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two registrations with the same username/email raced each other;
+        # the unique constraints are the safety net, so answer 400 not 500.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username or email already exists"
+        )
     db.refresh(new_user)
 
     return {"message": "User registered successfully", "user_id": new_user.id}
@@ -106,6 +133,8 @@ def create_transaction(
 
 @app.get("/transactions", response_model=list[TransactionResponse])
 def get_all_transactions(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -113,7 +142,7 @@ def get_all_transactions(
 
     transactions = db.query(Transaction).filter(
         Transaction.owner_id == current_user.id
-    ).order_by(Transaction.date.desc()).all()
+    ).order_by(Transaction.date.desc()).offset(offset).limit(limit).all()
 
     return transactions
 
